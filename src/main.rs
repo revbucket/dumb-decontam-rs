@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+use std::sync::Arc;
 use std::collections::HashMap;
 use dashmap::DashMap;
 use std::hash::Hasher;
@@ -28,6 +30,7 @@ Maybe I keep record of which reference docs and which byte indices?
 =                      COMMAND BLOCK            =
 ===============================================*/
 
+const CONTAM_CHUNK_SIZE: usize = 256000000;
 
 
 
@@ -56,6 +59,9 @@ enum Commands {
 
         #[arg(required = true, long)]
         output_dir: PathBuf,
+
+        #[arg(required = true, long)]
+        contam_dir: PathBuf,
 
         #[arg[required = true, long]]
         ngrams: usize,
@@ -121,7 +127,7 @@ fn hash_object<T: Hash + ?Sized>(obj: &T) -> usize {
 =                     DECONTAMINATION BLOCK               =
 =========================================================*/
 
-fn dencontam(reference_dir: &PathBuf, reference_key: &String, train_text_key: &String, input_dir: &PathBuf, output_dir: &PathBuf, ngram_size: usize, keep_only_clean: bool) -> Result<(), Error> {
+fn dencontam(reference_dir: &PathBuf, reference_key: &String, train_text_key: &String, input_dir: &PathBuf, output_dir: &PathBuf, contam_dir: &PathBuf, ngram_size: usize, keep_only_clean: bool) -> Result<(), Error> {
     let start_main = Instant::now();
     println!("Starting decontam!");
 
@@ -139,13 +145,37 @@ fn dencontam(reference_dir: &PathBuf, reference_key: &String, train_text_key: &S
     let contam_docs = AtomicUsize::new(0);
     let input_paths = expand_dirs(vec![input_dir.clone()], None).unwrap();
     let pbar = build_pbar(input_paths.len(), "input paths");
+    let contam_bytes : Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     input_paths.into_par_iter().for_each(|p| {
         let output_path = get_output_filename(&p, input_dir, output_dir).unwrap();
-        let (path_docs, path_contam_docs) = decontam_path(train_text_key, &p, &output_path, &reference_ngrams, ngram_size, keep_only_clean).unwrap();
+        let (path_docs, path_contam_docs, path_contam_bytes) = decontam_path(train_text_key, &p, &output_path, &reference_ngrams, ngram_size, keep_only_clean).unwrap();
         total_docs.fetch_add(path_docs, Ordering::SeqCst);
         contam_docs.fetch_add(path_contam_docs, Ordering::SeqCst);
+        if path_contam_bytes.len() > 0 {
+            contam_bytes.lock().unwrap().push(path_contam_bytes);
+        }
         pbar.inc(1);
     });
+
+    // Save the contaminated things
+    println!("Saving the contaminated data...");
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut cur_chunk: Vec<u8> = Vec::new();
+    let contam_bytes = Arc::try_unwrap(contam_bytes).unwrap().into_inner().unwrap();
+    contam_bytes.into_iter().for_each(|v| {
+        cur_chunk.extend(v);
+        if cur_chunk.len() >= CONTAM_CHUNK_SIZE {
+            chunks.push(std::mem::take(&mut cur_chunk));
+        }
+    });
+    if cur_chunk.len() > 0 {
+        chunks.push(cur_chunk);
+    }
+    chunks.into_par_iter().enumerate().for_each(|(i, v)| {
+        let contam_path = contam_dir.clone().join(format!("shard_{:8}.jsonl.zst", i));
+        write_mem_to_pathbuf(&v, &contam_path).unwrap();
+    });
+
 
 
     let total_docs = total_docs.into_inner();
@@ -197,7 +227,7 @@ fn process_eval_set(input_dir: &PathBuf, text_key: &str, ngram_size: usize) -> R
 }   
 
 fn decontam_path(train_text_key: &String, input_path: &PathBuf, output_path: &PathBuf, reference_ngrams: &DashMap<usize, Vec<(usize, usize, usize)>>, 
-                 ngram_size: usize, keep_only_clean: bool) -> Result<(usize, usize), Error> {
+                 ngram_size: usize, keep_only_clean: bool) -> Result<(usize, usize, Vec<u8>), Error> {
     // Annotates path with norm_text, and also the set of contams
     // contam: {text_idx: [(file_id, line_num, ngram_start_idx), ...]}
 
@@ -205,6 +235,7 @@ fn decontam_path(train_text_key: &String, input_path: &PathBuf, output_path: &Pa
     let mut total_lines = 0;
     let mut contam_lines = 0;
     let mut output_bytes: Vec<u8> = Vec::new();
+    let mut contaminated_bytes: Vec<u8> = Vec::new();
     let norm_text_key = train_text_key.clone() + "_normalized";
     for line in contents.lines() {
         total_lines += 1;
@@ -229,10 +260,15 @@ fn decontam_path(train_text_key: &String, input_path: &PathBuf, output_path: &Pa
             output_bytes.extend(serde_json::to_vec(&line_json).unwrap());
             output_bytes.push(b'\n');
         }
+
+        if keep_only_clean && decon.len() > 0 {
+            contaminated_bytes.extend(serde_json::to_vec(&line_json).unwrap());
+            contaminated_bytes.push(b'\n');
+        }
     }
 
     write_mem_to_pathbuf(&output_bytes, output_path).unwrap();
-    Ok((total_lines, contam_lines))
+    Ok((total_lines, contam_lines, contaminated_bytes))
 }
 
 
@@ -252,9 +288,10 @@ fn main() {
             train_text_key,
             input_dir,
             output_dir,
+            contam_dir,
             ngrams,   
             keep_only_clean     
-        } => dencontam(reference_dir, reference_key, train_text_key, input_dir, output_dir, *ngrams, *keep_only_clean),
+        } => dencontam(reference_dir, reference_key, train_text_key, input_dir, output_dir, contam_dir, *ngrams, *keep_only_clean),
     };
     result.unwrap();
 }
