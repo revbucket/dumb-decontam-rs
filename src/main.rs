@@ -172,7 +172,7 @@ fn dencontam(reference_dir: &PathBuf, reference_key: &String, train_text_key: &S
         chunks.push(cur_chunk);
     }
     chunks.into_par_iter().enumerate().for_each(|(i, v)| {
-        let contam_path = contam_dir.clone().join(format!("shard_{:8}.jsonl.zst", i));
+        let contam_path = contam_dir.clone().join(format!("shard_{:08}.jsonl.zst", i));
         write_mem_to_pathbuf(&v, &contam_path).unwrap();
     });
 
